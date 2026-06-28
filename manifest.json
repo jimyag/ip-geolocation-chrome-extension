@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "IP定位",
+  "version": "1.0",
+  "description": "基于IP位置自动更新浏览器的GPS位置。",
+  "permissions": [
+    "storage",
+    "alarms",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "128": "icon.png"
+  },
+  "sandbox": {
+    "pages": [
+      "map.html"
+    ]
+  },
+  "content_security_policy": {
+    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval'; child-src 'none'; object-src 'none'"
+  },
+  "web_accessible_resources": [{
+    "resources": ["map.html"],
+    "matches": ["<all_urls>"]
+  }]
+}

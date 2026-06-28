@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; width: 320px; padding: 15px; margin: 0; color: #333; display: flex; flex-direction: column; }
+    iframe { border: none; width: 100%; height: 200px; }
+    #info-grid { display: grid; grid-template-columns: 70px 1fr; gap: 5px 10px; font-size: 13px; margin: 15px 0; }
+    #info-grid strong { font-weight: 600; color: #555; }
+    button { width: 100%; padding: 10px; font-size: 14px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 5px; transition: background-color 0.2s; }
+    button:hover:not(:disabled) { background-color: #0056b3; }
+    button:disabled { background-color: #aaa; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <iframe id="map-frame" src="map.html"></iframe>
+  <div id="info-grid">
+    <strong>国家:</strong> <span id="country">加载中...</span>
+    <strong>纬度:</strong> <span id="latitude">加载中...</span>
+    <strong>经度:</strong> <span id="longitude">加载中...</span>
+    <strong>更新于:</strong> <span id="updateTime">加载中...</span>
+  </div>
+  <button id="refresh-btn">立即刷新</button>
+  <script src="popup.js"></script>
+</body>
+</html>
