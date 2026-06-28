@@ -6,6 +6,12 @@ const FALLBACK_LOCATION = {
   country: '中国 (隐私保护)'
 };
 
+function hasValidCoordinates(location) {
+  return location &&
+    Number.isFinite(location.latitude) &&
+    Number.isFinite(location.longitude);
+}
+
 const spooferFunction = (latitude, longitude) => {
   navigator.geolocation.getCurrentPosition = (successCallback, errorCallback, options) => {
     successCallback({
@@ -26,8 +32,8 @@ const spooferFunction = (latitude, longitude) => {
 
 async function injectScript(tabId) {
   const { lastLocation } = await chrome.storage.local.get('lastLocation');
-  if (lastLocation && lastLocation.latitude && lastLocation.longitude) {
-    chrome.scripting.executeScript({
+  if (hasValidCoordinates(lastLocation)) {
+    await chrome.scripting.executeScript({
       target: { tabId: tabId, allFrames: true },
       func: spooferFunction,
       args: [lastLocation.latitude, lastLocation.longitude],
@@ -41,7 +47,7 @@ async function updateAllTabs() {
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
     if (tab.id) {
-      injectScript(tab.id);
+      await injectScript(tab.id);
     }
   }
 }
@@ -53,7 +59,7 @@ async function updateGeolocation(forceUpdate = false) {
     if (!response.ok) return;
 
     const data = await response.json();
-    if (!data || !data.latitude || !data.longitude) return;
+    if (!data || data.latitude == null || data.longitude == null) return;
 
     const lat = parseFloat(data.latitude);
     const lon = parseFloat(data.longitude);

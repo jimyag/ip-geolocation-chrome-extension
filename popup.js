@@ -5,15 +5,19 @@ const updateTimeEl = document.getElementById('updateTime');
 const refreshBtn = document.getElementById('refresh-btn');
 const mapFrame = document.getElementById('map-frame');
 
+function formatValue(value) {
+  return value ?? 'N/A';
+}
+
 function updateUI(locationData) {
   if (!locationData) {
     [countryEl, latitudeEl, longitudeEl, updateTimeEl].forEach(el => el.textContent = '暂无数据');
     return;
   }
   countryEl.textContent = locationData.country || 'N/A';
-  latitudeEl.textContent = locationData.latitude || 'N/A';
-  longitudeEl.textContent = locationData.longitude || 'N/A';
-  updateTimeEl.textContent = locationData.updateTime || 'N/A';
+  latitudeEl.textContent = formatValue(locationData.latitude);
+  longitudeEl.textContent = formatValue(locationData.longitude);
+  updateTimeEl.textContent = formatValue(locationData.updateTime);
 
   const payload = {
     location: locationData,
