@@ -31,12 +31,7 @@ jobs:
             background.js \
             popup.html \
             popup.js \
-            map.html \
-            map.js \
-            leaflet.css \
-            leaflet.js \
-            icon.png \
-            images
+            icon.png
 
       - name: Publish GitHub release
         env:
