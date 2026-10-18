@@ -38,6 +38,11 @@ async function displayLocation() {
     document.getElementById('source').textContent = '暂无数据';
   }
   document.getElementById('status').textContent = [health?.message, lastFailure && `最近失败（${lastFailure.time}）：${lastFailure.message}`, notificationError && `系统通知发送失败：${notificationError}`].filter(Boolean).join('\n');
+  const tabs = await chrome.tabs.query({});
+  const deferred = tabs.filter(tab => /^https?:/.test(tab.url || '') &&
+    (tab.frozen || tab.discarded || tab.status === 'unloaded'));
+  document.getElementById('deferred-status').textContent = deferred.length
+    ? `${deferred.length} 个页面被冻结或尚未加载，恢复后自动更新定位，不发送系统通知。` : '';
   if (lastFailure && lastFailure.id !== displayedFailure) {
     displayedFailure = lastFailure.id;
     showFailure(`${lastFailure.time}\n${lastFailure.message}${notificationError ? `\n系统通知发送失败：${notificationError}` : ''}`);

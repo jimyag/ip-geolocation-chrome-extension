@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "IP定位",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "基于IP位置自动更新浏览器的GPS位置。",
   "permissions": [
     "storage",

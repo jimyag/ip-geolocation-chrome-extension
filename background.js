@@ -2,19 +2,46 @@ const API_ENDPOINTS = ['https://ipwho.is/', 'https://api.ip.sb/geoip', 'https://
 const REQUEST_TIMEOUT_MS = 8000;
 const ALARM_NAME = 'updateGeoAlarm';
 const INJECTION_TIMEOUT_MS = 8000;
+const NOTIFICATION_COOLDOWN_MS = 5 * 60 * 1000;
 let failureSequence = 0;
+let failureQueue = Promise.resolve();
 
-async function reportFailure(message) {
-  const failure = { message, time: new Date().toLocaleString(), id: `${Date.now()}-${failureSequence++}` };
-  await chrome.storage.local.set({ lastFailure: failure }).catch(console.error);
-  await chrome.action.setBadgeText({ text: '!' }).catch(console.error);
-  await chrome.action.setBadgeBackgroundColor({ color: '#c0392b' }).catch(console.error);
-  await chrome.notifications.create(`location-error-${failure.id}`, {
-    type: 'basic', iconUrl: chrome.runtime.getURL('icon.png'),
-    title: 'IP定位操作失败', message, requireInteraction: true
-  }).then(() => chrome.storage.local.remove('notificationError')).catch(async error => {
-    console.error('发送通知失败:', error);
-    await chrome.storage.local.set({ notificationError: error.message }).catch(console.error);
+function updateFailureState(action) {
+  const result = failureQueue.then(action, action);
+  failureQueue = result.catch(console.error);
+  return result;
+}
+
+function reportFailure(message, key = message) {
+  return updateFailureState(async () => {
+    const { activeFailures = {}, lastFailure, lastNotificationAt } = await chrome.storage.local.get(['activeFailures', 'lastFailure', 'lastNotificationAt']);
+    const existing = activeFailures[key];
+    const failure = { message, key, time: new Date().toLocaleString(), id: existing?.id || `${Date.now()}-${failureSequence++}` };
+    const values = { activeFailures: { ...activeFailures, [key]: failure } };
+    // 同一未确认的故障只更新详情，不重复弹出扩展内对话框。
+    if (lastFailure || !existing) values.lastFailure = { ...failure, id: lastFailure?.id || failure.id };
+    await chrome.storage.local.set(values).catch(console.error);
+    await chrome.action.setBadgeText({ text: '!' }).catch(console.error);
+    await chrome.action.setBadgeBackgroundColor({ color: '#c0392b' }).catch(console.error);
+    if (existing || (lastNotificationAt && Date.now() - lastNotificationAt < NOTIFICATION_COOLDOWN_MS)) return;
+    await chrome.storage.local.set({ lastNotificationAt: Date.now() }).catch(console.error);
+    await chrome.notifications.create('location-error', {
+      type: 'basic', iconUrl: chrome.runtime.getURL('icon.png'),
+      title: 'IP定位操作失败', message: `${message}\n详细错误可在扩展弹窗查看。`, requireInteraction: true
+    }).then(() => chrome.storage.local.remove('notificationError')).catch(async error => {
+      console.error('发送通知失败:', error);
+      await chrome.storage.local.set({ notificationError: error.message }).catch(console.error);
+    });
+  });
+}
+
+function clearFailure(key) {
+  return updateFailureState(async () => {
+    const { activeFailures = {}, lastFailure } = await chrome.storage.local.get(['activeFailures', 'lastFailure']);
+    if (!activeFailures[key]) return;
+    delete activeFailures[key];
+    await chrome.storage.local.set({ activeFailures });
+    if (lastFailure?.key === key) await chrome.storage.local.remove('lastFailure');
   });
 }
 
@@ -51,10 +78,12 @@ async function fetchLocation() {
         cache: 'no-store', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return { ...normalizeLocation(await response.json()), source: endpoint, errors };
+      const location = normalizeLocation(await response.json());
+      await clearFailure(`ip:${endpoint}`);
+      return { ...location, source: endpoint, errors };
     } catch (error) {
       errors.push(`${endpoint}: ${error.message}`);
-      await reportFailure(`获取 IP 定位失败：${endpoint}\n${error.message}。${endpoint === API_ENDPOINTS.at(-1) ? '已无备用接口。' : '正在尝试备用接口。'}`);
+      await reportFailure(`获取 IP 定位失败：${endpoint}\n${error.message}。${endpoint === API_ENDPOINTS.at(-1) ? '已无备用接口。' : '正在尝试备用接口。'}`, `ip:${endpoint}`);
     }
   }
   throw new Error(errors.join('\n'));
@@ -86,9 +115,16 @@ const spooferFunction = (latitude, longitude) => {
   };
 };
 
+function canInject(tab) {
+  return tab.id != null && /^https?:/.test(tab.url || '') &&
+    !tab.discarded && !tab.frozen && tab.status !== 'unloaded';
+}
+
 async function injectScript(tabId) {
   let timer;
   try {
+    // 冻结或尚未加载的标签没有可运行脚本的页面，恢复后由标签事件补注入。
+    if (!canInject(await chrome.tabs.get(tabId))) return;
     const { manualLocation, ipInfo, lastLocation: cachedLocation } = await chrome.storage.local.get(['manualLocation', 'ipInfo', 'lastLocation']);
     const lastLocation = manualLocation || (hasValidCoordinates(ipInfo) ? ipInfo : cachedLocation);
     if (lastLocation?.country === '中国 (隐私保护)') return;
@@ -102,9 +138,14 @@ async function injectScript(tabId) {
       }), new Promise((resolve, reject) => {
         timer = setTimeout(() => reject(new Error('网页定位注入等待超过 8 秒')), INJECTION_TIMEOUT_MS);
       })]);
+      await clearFailure(`tab:${tabId}`);
     }
   } catch (error) {
-    await reportFailure(`更新网页位置失败（标签页 ${tabId}）：${error.message}`);
+    if (/is showing error page|No tab with id:/.test(error.message)) return;
+    // 注入开始后标签仍可能被冻结或关闭，这不是需要系统通知的执行失败。
+    const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!currentTab || !canInject(currentTab)) return;
+    await reportFailure(`更新网页位置失败（标签页 ${tabId}）：${error.message}`, `tab:${tabId}`);
   } finally {
     clearTimeout(timer);
   }
@@ -113,9 +154,10 @@ async function injectScript(tabId) {
 async function updateAllTabs() {
   try {
     const tabs = await chrome.tabs.query({});
-    await Promise.allSettled(tabs.filter(tab => tab.id != null && /^https?:/.test(tab.url || '')).map(tab => injectScript(tab.id)));
+    await clearFailure('tabs');
+    await Promise.allSettled(tabs.filter(canInject).map(tab => injectScript(tab.id)));
   } catch (error) {
-    await reportFailure(`更新网页位置失败：${error.message}`);
+    await reportFailure(`更新网页位置失败：${error.message}`, 'tabs');
   }
 }
 
@@ -144,6 +186,7 @@ async function performUpdate() {
       ipInfo: { ...ipInfo, updateTime: locationToSet.updateTime }, lastLocation: locationToSet
     });
     await chrome.storage.local.remove('lastError');
+    await clearFailure('update');
     // 个别页面的 frame 注入可能一直等待，不能阻塞刷新响应。
     updateAllTabs().catch(console.error);
     await reportHealth(errors.length ? 'backup' : 'ok', errors.length
@@ -153,7 +196,7 @@ async function performUpdate() {
     console.error('后台更新地理位置失败:', error);
     const { lastLocation } = await chrome.storage.local.get('lastLocation');
     const message = `更新位置失败：${error.message}\n${hasValidCoordinates(lastLocation) ? '继续使用上次成功的缓存位置，可能已过时。' : '尚无可用的位置缓存。'}可在扩展弹窗设置手动经纬度。`;
-    await reportFailure(message);
+    await reportFailure(message, 'update');
     await reportHealth('error', message);
     await chrome.storage.local.set({ lastError: error.message });
     return { ok: false, error: error.message };
@@ -162,17 +205,20 @@ async function performUpdate() {
 
 function updateGeolocation() {
   if (!pendingUpdate) pendingUpdate = performUpdate().catch(async error => {
-    await reportFailure(`更新位置失败：${error.message}`);
+    await reportFailure(`更新位置失败：${error.message}`, 'update');
     return { ok: false, error: error.message };
   }).finally(() => { pendingUpdate = undefined; });
   return pendingUpdate;
 }
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'loading' && /^https?:/.test(tab.url || '')) {
+  if ((changeInfo.status === 'loading' || changeInfo.status === 'complete' ||
+       changeInfo.frozen === false || changeInfo.discarded === false) && canInject(tab)) {
     injectScript(tabId);
   }
 });
+
+chrome.tabs.onActivated.addListener(({ tabId }) => injectScript(tabId));
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
@@ -190,9 +236,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const location = { latitude: request.latitude, longitude: request.longitude };
         if (!hasValidCoordinates(location)) throw new Error('纬度须为 -90 到 90，经度须为 -180 到 180 的数字');
         await chrome.storage.local.set({ manualLocation: { ...location, country: '手动设置', source: '手动设置', updateTime: new Date().toLocaleString() } });
+        await clearFailure('action:setManualLocation');
         return await updateGeolocation();
       }
-      if (request.action === 'useAutomaticLocation') await chrome.storage.local.remove('manualLocation');
+      if (request.action === 'useAutomaticLocation') {
+        await chrome.storage.local.remove('manualLocation');
+        await clearFailure('action:useAutomaticLocation');
+      }
       if (request.action === 'dismissFailure') {
         const { lastFailure, health } = await chrome.storage.local.get(['lastFailure', 'health']);
         if (lastFailure?.id === request.id) {
@@ -203,7 +253,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
       return await updateGeolocation();
     } catch (error) {
-      await reportFailure(`操作失败：${error.message}`);
+      await reportFailure(`操作失败：${error.message}`, `action:${request.action}`);
       return { ok: false, error: error.message };
     }
   })().then(sendResponse, error => sendResponse({ ok: false, error: error.message }));

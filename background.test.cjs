@@ -7,6 +7,8 @@ function setup(fetch, executeScript = async () => {}) {
   const store = {}, notifications = [], requests = [], timers = new Map();
   let onMessage;
   const event = { addListener() {} };
+  let tabUpdated, tabActivated;
+  const tabRows = [{ id: 1, url: 'https://example.com', status: 'complete' }, { id: 2, url: 'chrome://extensions/', status: 'complete' }];
   const context = vm.createContext({
     console: { log() {}, error() {} }, AbortSignal,
     setTimeout(callback) { const id = {}; timers.set(id, callback); return id; },
@@ -18,7 +20,12 @@ function setup(fetch, executeScript = async () => {}) {
         async set(values) { Object.assign(store, structuredClone(values)); },
         async remove(keys) { for (const key of [].concat(keys)) delete store[key]; }
       } },
-      tabs: { onUpdated: event, async query() { return [{ id: 1, url: 'https://example.com' }, {id: 2, url: 'chrome://extensions/'}]; } },
+      tabs: {
+        onUpdated: { addListener(listener) { tabUpdated = listener; } },
+        onActivated: { addListener(listener) { tabActivated = listener; } },
+        async query() { return structuredClone(tabRows); },
+        async get(id) { const tab = tabRows.find(tab => tab.id === id); if (!tab) throw new Error(`No tab with id: ${id}`); return structuredClone(tab); }
+      },
       scripting: { executeScript },
       alarms: { onAlarm: event, create() {} },
       action: { async setBadgeText() {}, async setBadgeBackgroundColor() {} },
@@ -29,7 +36,8 @@ function setup(fetch, executeScript = async () => {}) {
   });
   vm.runInContext(fs.readFileSync(`${__dirname}/background.js`, 'utf8'), context);
   const send = request => new Promise(resolve => { onMessage(request, {}, resolve); });
-  return { store, notifications, requests, send,
+  return { store, notifications, requests, send, tabRows,
+    tabUpdated: (...args) => tabUpdated?.(...args), tabActivated: (...args) => tabActivated?.(...args),
     storage: context.chrome.storage.local, notificationApi: context.chrome.notifications,
     refresh: () => send({ action: 'manualUpdate' }),
     fireTimeouts() { for (const callback of timers.values()) callback(); timers.clear(); } };
@@ -54,10 +62,10 @@ test('switches past network and invalid data, adapts ip9 and injects exact cache
   assert.deepEqual(Array.from(injected[0]), [39.93, 116.41]);
   assert.equal(app.store.health.state, 'backup');
   await app.refresh();
-  assert.equal(app.notifications.length, 4);
+  assert.equal(app.notifications.length, 1);
 });
 
-test('every failed attempt notifies, preserves successful cache and recovers', async () => {
+test('persistent failures keep cache and details without repeating notifications', async () => {
   let offline = false;
   const app = setup(async () => { if (offline) throw new Error('offline'); return response(good); });
   await app.refresh();
@@ -67,7 +75,7 @@ test('every failed attempt notifies, preserves successful cache and recovers', a
   assert.deepEqual(app.store.ipInfo, cached);
   assert.equal(app.store.health.state, 'error');
   await app.refresh();
-  assert.equal(app.notifications.length, 8);
+  assert.equal(app.notifications.length, 1);
   offline = false;
   assert.equal((await app.refresh()).ok, true);
   assert.equal(app.store.health.state, 'ok');
@@ -122,9 +130,10 @@ test('non-CN coordinates remain intact and failure can notify again after recove
   await app.refresh();
   fail = false;
   await app.refresh();
+  app.store.lastNotificationAt = Date.now() - 5 * 60 * 1000 - 1;
   fail = true;
   await app.refresh();
-  assert.equal(app.notifications.length, 8);
+  assert.equal(app.notifications.length, 2);
 });
 
 test('manual coordinates take priority, persist across refreshes, and automatic mode can be restored', async () => {
@@ -152,7 +161,7 @@ test('invalid manual input notifies and does not replace the current setting', a
     assert.equal((await app.send({ action: 'setManualLocation', latitude, longitude: 0 })).ok, false);
   }
   assert.equal(app.store.manualLocation.latitude, 90);
-  assert.equal(app.notifications.length, 4);
+  assert.equal(app.notifications.length, 1);
   assert.equal(app.notifications.every(item => item.requireInteraction), true);
 });
 
@@ -193,4 +202,54 @@ test('notification API failure stays visible and acknowledgement cannot dismiss 
   await app.send({ action: 'dismissFailure', id });
   assert.equal(app.store.lastFailure, undefined);
   assert.equal(app.store.notificationError, undefined);
+});
+
+test('defers frozen, unloaded and discarded tabs until they resume or load', async () => {
+  const injected = [];
+  const app = setup(async () => response(good), async options => { injected.push(options.target.tabId); });
+  app.tabRows.push(
+    {id: 3, url: 'https://frozen.example', status: 'complete', frozen: true},
+    {id: 4, url: 'https://unloaded.example', status: 'unloaded'},
+    {id: 5, url: 'https://discarded.example', status: 'complete', discarded: true}
+  );
+  await app.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(injected, [1]);
+  app.tabRows[2].frozen = false;
+  app.tabUpdated(3, {frozen: false}, app.tabRows[2]);
+  app.tabRows[3].status = 'complete';
+  app.tabUpdated(4, {status: 'complete'}, app.tabRows[3]);
+  app.tabRows[4].discarded = false;
+  app.tabActivated({tabId: 5});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(injected.sort(), [1,3,4,5]);
+  assert.equal(app.notifications.length, 0);
+});
+
+test('browser error documents are skipped but genuine access failures still notify', async () => {
+  const app = setup(async () => response(good), async () => { throw new Error('Frame with ID 0 is showing error page'); });
+  await app.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.notifications.length, 0);
+  const denied = setup(async () => response(good), async () => { throw new Error('Cannot access contents of the page'); });
+  await denied.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(denied.notifications.length, 1);
+});
+
+test('cooldown combines different failures, and an ongoing failure stays quiet after cooldown', async () => {
+  const app = setup(async () => { throw new Error('offline'); });
+  await app.refresh();
+  const id = app.store.lastFailure.id;
+  assert.equal(app.notifications.length, 1);
+  await app.send({ action: 'setManualLocation', latitude: 100, longitude: 0 });
+  assert.equal(app.notifications.length, 1);
+  assert.equal(app.store.lastFailure.id, id);
+  app.store.lastNotificationAt = Date.now() - 5 * 60 * 1000 - 1;
+  await app.refresh();
+  assert.equal(app.notifications.length, 1);
+  await app.send({ action: 'dismissFailure', id });
+  await app.refresh();
+  assert.equal(app.store.lastFailure, undefined);
+  assert.equal(app.notifications.length, 1);
 });
