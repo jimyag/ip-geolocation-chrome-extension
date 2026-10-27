@@ -3,12 +3,11 @@ const latitudeEl = document.getElementById('latitude');
 const longitudeEl = document.getElementById('longitude');
 const updateTimeEl = document.getElementById('updateTime');
 const refreshBtn = document.getElementById('refresh-btn');
-const failureDialog = document.getElementById('failure-dialog');
+const dismissFailureBtn = document.getElementById('dismiss-failure');
 let displayedFailure;
 
 function showFailure(message) {
-  document.getElementById('failure-message').textContent = message;
-  if (!failureDialog.open) failureDialog.showModal();
+  document.getElementById('status').textContent = message;
 }
 
 function formatValue(value) {
@@ -30,23 +29,21 @@ function updateUI(locationData) {
 }
 
 async function displayLocation() {
-  const { manualLocation, ipInfo, lastLocation: cachedLocation, health, lastFailure, notificationError } = await chrome.storage.local.get(['manualLocation', 'ipInfo', 'lastLocation', 'health', 'lastFailure', 'notificationError']);
+  const { manualLocation, ipInfo, lastLocation: cachedLocation, health, lastFailure } = await chrome.storage.local.get(['manualLocation', 'ipInfo', 'lastLocation', 'health', 'lastFailure']);
   const lastLocation = manualLocation || ipInfo || (cachedLocation?.country === '中国 (隐私保护)' ? null : cachedLocation);
   updateUI(lastLocation);
   if (!lastLocation) {
     document.getElementById('ip').textContent = '暂无数据';
     document.getElementById('source').textContent = '暂无数据';
   }
-  document.getElementById('status').textContent = [health?.message, lastFailure && `最近失败（${lastFailure.time}）：${lastFailure.message}`, notificationError && `系统通知发送失败：${notificationError}`].filter(Boolean).join('\n');
+  document.getElementById('status').textContent = [health?.message, lastFailure && `最近失败（${lastFailure.time}）：${lastFailure.message}`].filter(Boolean).join('\n');
+  displayedFailure = lastFailure?.id;
+  dismissFailureBtn.hidden = !lastFailure;
   const tabs = await chrome.tabs.query({});
   const deferred = tabs.filter(tab => /^https?:/.test(tab.url || '') &&
     (tab.frozen || tab.discarded || tab.status === 'unloaded'));
   document.getElementById('deferred-status').textContent = deferred.length
-    ? `${deferred.length} 个页面被冻结或尚未加载，恢复后自动更新定位，不发送系统通知。` : '';
-  if (lastFailure && lastFailure.id !== displayedFailure) {
-    displayedFailure = lastFailure.id;
-    showFailure(`${lastFailure.time}\n${lastFailure.message}${notificationError ? `\n系统通知发送失败：${notificationError}` : ''}`);
-  }
+    ? `${deferred.length} 个页面被冻结或尚未加载，恢复后自动更新定位。` : '';
 }
 
 async function performAction(request) {
@@ -71,8 +68,7 @@ document.getElementById('manual-form').addEventListener('submit', event => {
     longitude: document.getElementById('manual-longitude').valueAsNumber });
 });
 document.getElementById('automatic-btn').addEventListener('click', () => performAction({ action: 'useAutomaticLocation' }));
-document.getElementById('dismiss-failure').addEventListener('click', () => {
-  failureDialog.close();
+dismissFailureBtn.addEventListener('click', () => {
   performAction({ action: 'dismissFailure', id: displayedFailure });
 });
 

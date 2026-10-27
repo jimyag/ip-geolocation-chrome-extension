@@ -6,8 +6,8 @@ const fs = require('node:fs');
 function setup(fetch, executeScript = async () => {}) {
   const store = {}, notifications = [], requests = [], timers = new Map();
   let onMessage;
-  const event = { addListener() {} };
-  let tabUpdated, tabActivated;
+  let tabUpdated, tabActivated, installed, startup, alarm;
+  const alarms = [];
   const tabRows = [{ id: 1, url: 'https://example.com', status: 'complete' }, { id: 2, url: 'chrome://extensions/', status: 'complete' }];
   const context = vm.createContext({
     console: { log() {}, error() {} }, AbortSignal,
@@ -27,18 +27,21 @@ function setup(fetch, executeScript = async () => {}) {
         async get(id) { const tab = tabRows.find(tab => tab.id === id); if (!tab) throw new Error(`No tab with id: ${id}`); return structuredClone(tab); }
       },
       scripting: { executeScript },
-      alarms: { onAlarm: event, create() {} },
+      alarms: { onAlarm: { addListener(listener) { alarm = listener; } }, create(name, options) { alarms.push({ name, ...options }); } },
       action: { async setBadgeText() {}, async setBadgeBackgroundColor() {} },
       notifications: { async create(id, data) { notifications.push(data); }, async clear() {} },
-      runtime: { getURL: name => name, onInstalled: event, onStartup: event,
+      runtime: { getURL: name => name,
+        onInstalled: { addListener(listener) { installed = listener; } },
+        onStartup: { addListener(listener) { startup = listener; } },
         onMessage: { addListener(listener) { onMessage = listener; } } }
     }
   });
   vm.runInContext(fs.readFileSync(`${__dirname}/background.js`, 'utf8'), context);
   const send = request => new Promise(resolve => { onMessage(request, {}, resolve); });
-  return { store, notifications, requests, send, tabRows,
+  return { store, notifications, requests, send, tabRows, alarms,
+    installed: () => installed(), startup: () => startup(), alarm: name => alarm({ name }),
     tabUpdated: (...args) => tabUpdated?.(...args), tabActivated: (...args) => tabActivated?.(...args),
-    storage: context.chrome.storage.local, notificationApi: context.chrome.notifications,
+    storage: context.chrome.storage.local,
     refresh: () => send({ action: 'manualUpdate' }),
     fireTimeouts() { for (const callback of timers.values()) callback(); timers.clear(); } };
 }
@@ -62,10 +65,10 @@ test('switches past network and invalid data, adapts ip9 and injects exact cache
   assert.deepEqual(Array.from(injected[0]), [39.93, 116.41]);
   assert.equal(app.store.health.state, 'backup');
   await app.refresh();
-  assert.equal(app.notifications.length, 1);
+  assert.equal(app.notifications.length, 0);
 });
 
-test('persistent failures keep cache and details without repeating notifications', async () => {
+test('persistent failures keep cache and details without system notifications', async () => {
   let offline = false;
   const app = setup(async () => { if (offline) throw new Error('offline'); return response(good); });
   await app.refresh();
@@ -75,7 +78,7 @@ test('persistent failures keep cache and details without repeating notifications
   assert.deepEqual(app.store.ipInfo, cached);
   assert.equal(app.store.health.state, 'error');
   await app.refresh();
-  assert.equal(app.notifications.length, 1);
+  assert.equal(app.notifications.length, 0);
   offline = false;
   assert.equal((await app.refresh()).ok, true);
   assert.equal(app.store.health.state, 'ok');
@@ -117,7 +120,7 @@ test('old privacy cache is replaced by original API coordinates even while offli
   assert.deepEqual(Array.from(injected[0]), [good.latitude, good.longitude]);
 });
 
-test('non-CN coordinates remain intact and failure can notify again after recovery', async () => {
+test('non-CN coordinates remain intact and recurring failures stay in the extension', async () => {
   let fail = false;
   const app = setup(async () => {
     if (fail) throw new Error('offline');
@@ -130,10 +133,10 @@ test('non-CN coordinates remain intact and failure can notify again after recove
   await app.refresh();
   fail = false;
   await app.refresh();
-  app.store.lastNotificationAt = Date.now() - 5 * 60 * 1000 - 1;
   fail = true;
   await app.refresh();
-  assert.equal(app.notifications.length, 2);
+  assert.match(app.store.lastFailure.message, /offline/);
+  assert.equal(app.notifications.length, 0);
 });
 
 test('manual coordinates take priority, persist across refreshes, and automatic mode can be restored', async () => {
@@ -154,32 +157,32 @@ test('manual coordinates take priority, persist across refreshes, and automatic 
   assert.deepEqual(Array.from(injected.at(-1).args), [good.latitude, good.longitude]);
 });
 
-test('invalid manual input notifies and does not replace the current setting', async () => {
+test('invalid manual input records an error and does not replace the current setting', async () => {
   const app = setup(async () => response(good));
   await app.send({ action: 'setManualLocation', latitude: 90, longitude: -180 });
   for (const latitude of [91, null, '', NaN]) {
     assert.equal((await app.send({ action: 'setManualLocation', latitude, longitude: 0 })).ok, false);
   }
   assert.equal(app.store.manualLocation.latitude, 90);
-  assert.equal(app.notifications.length, 1);
-  assert.equal(app.notifications.every(item => item.requireInteraction), true);
+  assert.match(app.store.lastFailure.message, /纬度须为/);
+  assert.equal(app.notifications.length, 0);
 });
 
-test('injection failure and timeout each produce a persistent failure alert', async () => {
+test('injection failure and timeout each record persistent failure details', async () => {
   const failed = setup(async () => response(good), async () => { throw new Error('frame failed'); });
   await failed.refresh();
   await new Promise(resolve => setImmediate(resolve));
   assert.match(failed.store.lastFailure.message, /更新网页位置失败.*frame failed/);
-  assert.equal(failed.notifications.length, 1);
+  assert.equal(failed.notifications.length, 0);
   const hanging = setup(async () => response(good), () => new Promise(() => {}));
   await hanging.refresh();
   hanging.fireTimeouts();
   await new Promise(resolve => setImmediate(resolve));
   assert.match(hanging.store.lastFailure.message, /超过 8 秒/);
-  assert.equal(hanging.notifications.length, 1);
+  assert.equal(hanging.notifications.length, 0);
 });
 
-test('failure to save updated location notifies with the actual error', async () => {
+test('failure to save updated location records the actual error', async () => {
   const app = setup(async () => response(good));
   const save = app.storage.set;
   app.storage.set = async values => {
@@ -188,20 +191,18 @@ test('failure to save updated location notifies with the actual error', async ()
   };
   assert.equal((await app.refresh()).ok, false);
   assert.match(app.store.lastFailure.message, /storage quota exceeded/);
-  assert.equal(app.notifications.length, 1);
+  assert.equal(app.notifications.length, 0);
 });
 
-test('notification API failure stays visible and acknowledgement cannot dismiss a newer failure', async () => {
+test('acknowledgement cannot dismiss a newer failure', async () => {
   const app = setup(async () => { throw new Error('offline'); });
-  app.notificationApi.create = async () => { throw new Error('notifications disabled'); };
   await app.refresh();
-  assert.equal(app.store.notificationError, 'notifications disabled');
   const id = app.store.lastFailure.id;
   await app.send({ action: 'dismissFailure', id: 'old-error' });
   assert.equal(app.store.lastFailure.id, id);
   await app.send({ action: 'dismissFailure', id });
   assert.equal(app.store.lastFailure, undefined);
-  assert.equal(app.store.notificationError, undefined);
+  assert.equal(app.notifications.length, 0);
 });
 
 test('defers frozen, unloaded and discarded tabs until they resume or load', async () => {
@@ -226,7 +227,7 @@ test('defers frozen, unloaded and discarded tabs until they resume or load', asy
   assert.equal(app.notifications.length, 0);
 });
 
-test('browser error documents are skipped but genuine access failures still notify', async () => {
+test('browser error documents are skipped but genuine access failures are recorded', async () => {
   const app = setup(async () => response(good), async () => { throw new Error('Frame with ID 0 is showing error page'); });
   await app.refresh();
   await new Promise(resolve => setImmediate(resolve));
@@ -234,22 +235,140 @@ test('browser error documents are skipped but genuine access failures still noti
   const denied = setup(async () => response(good), async () => { throw new Error('Cannot access contents of the page'); });
   await denied.refresh();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(denied.notifications.length, 1);
+  assert.match(denied.store.lastFailure.message, /Cannot access contents/);
+  assert.equal(denied.notifications.length, 0);
 });
 
-test('cooldown combines different failures, and an ongoing failure stays quiet after cooldown', async () => {
+test('failures remain available for acknowledgement and an acknowledged ongoing failure stays quiet', async () => {
   const app = setup(async () => { throw new Error('offline'); });
   await app.refresh();
   const id = app.store.lastFailure.id;
-  assert.equal(app.notifications.length, 1);
+  assert.equal(app.notifications.length, 0);
   await app.send({ action: 'setManualLocation', latitude: 100, longitude: 0 });
-  assert.equal(app.notifications.length, 1);
+  assert.equal(app.notifications.length, 0);
   assert.equal(app.store.lastFailure.id, id);
-  app.store.lastNotificationAt = Date.now() - 5 * 60 * 1000 - 1;
   await app.refresh();
-  assert.equal(app.notifications.length, 1);
+  assert.equal(app.notifications.length, 0);
   await app.send({ action: 'dismissFailure', id });
   await app.refresh();
   assert.equal(app.store.lastFailure, undefined);
-  assert.equal(app.notifications.length, 1);
+  assert.equal(app.notifications.length, 0);
+});
+
+test('Google refresh clicks only China-related footers after spoofing, with cooldown and coordinate changes', async () => {
+  let text = 'China - From your IP address', label = 'Update location', clicks = 0, now = 1000000;
+  let hasFooter = true, hasButton = true;
+  const page = vm.createContext({
+    Date: { now: () => now },
+    navigator: { geolocation: {} },
+    document: { querySelector() {
+      return hasFooter ? { innerText: text, querySelectorAll() {
+        return hasButton ? [{ innerText: label, textContent: 'Update locationCan\'t update your locationLearn moreUpdating location...', click() {
+          page.navigator.geolocation.getCurrentPosition(position => {
+            const expected = app.store.manualLocation || app.store.lastLocation;
+            assert.equal(position.coords.latitude, expected.latitude);
+            assert.equal(position.coords.longitude, expected.longitude);
+          });
+          clicks++;
+        } }] : [];
+      } } : null;
+    } }
+  });
+  const injections = [];
+  const app = setup(async () => response(good), async options => {
+    injections.push(options.world);
+    vm.runInContext(`(${options.func.toString()})(...${JSON.stringify(options.args)})`, page);
+  });
+  app.tabRows[0].url = 'https://www.google.com/search?q=China';
+  await app.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(injections, ['MAIN', 'ISOLATED']);
+  assert.equal(clicks, 1);
+  await app.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(clicks, 1);
+  now += 5 * 60 * 1000;
+  await app.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(clicks, 2);
+  // A changed exit bypasses the cooldown; a normal footer must not react to the search query.
+  await app.send({ action: 'setManualLocation', latitude: 37.33, longitude: -121.89 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(clicks, 3);
+  now += 5 * 60 * 1000;
+  for (const footer of ['95110, San Jose, CA - From your device', 'Chinatown', '']) {
+    text = footer;
+    await app.refresh();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(clicks, 3);
+  for (const [footer, button] of [['中国', '更新位置'], ['中國', '更新位置'], ['CHINA', 'Update location']]) {
+    text = footer; label = button;
+    await app.refresh();
+    await new Promise(resolve => setImmediate(resolve));
+    now += 5 * 60 * 1000;
+  }
+  assert.equal(clicks, 6);
+  hasFooter = false;
+  await app.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  hasFooter = true; hasButton = false;
+  await app.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(clicks, 6);
+  assert.equal(app.notifications.length, 0);
+  hasButton = true;
+  for (const url of ['https://www.google.com/maps', 'https://www.google.com.evil.test/search', 'https://example.com/search']) {
+    app.tabRows[0].url = url;
+    await app.refresh();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(clicks, 6);
+});
+
+test('install and startup schedule a five-minute refresh and alarm fetches a new exit', async () => {
+  const app = setup(async () => response(good));
+  app.installed();
+  await new Promise(resolve => setImmediate(resolve));
+  app.startup();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.alarms.length, 2);
+  assert.equal(app.alarms.every(alarm => alarm.periodInMinutes === 5), true);
+  const requests = app.requests.length;
+  app.alarm('updateGeoAlarm');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.requests.length, requests + 1);
+});
+
+test('popup displays stored and action errors inline and allows acknowledgement without a dialog', async () => {
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, { id, textContent: '', hidden: false, addEventListener(type, handler) { this[type] = handler; } });
+    return elements.get(id);
+  };
+  const store = { lastFailure: { id: 'failure-1', time: 'now', message: 'IP request timed out' } };
+  const context = vm.createContext({
+    document: { getElementById: element, querySelectorAll: () => [], addEventListener() {} },
+    chrome: {
+      storage: { local: { async get() { return structuredClone(store); } }, onChanged: { addListener() {} } },
+      tabs: { async query() { return []; } },
+      runtime: { async sendMessage(request) {
+        if (request.action === 'dismissFailure' && request.id === store.lastFailure.id) {
+          delete store.lastFailure;
+          return { ok: true };
+        }
+        throw new Error('Extension connection failed');
+      } }
+    }
+  });
+  vm.runInContext(fs.readFileSync(`${__dirname}/popup.js`, 'utf8'), context);
+  await vm.runInContext('displayLocation()', context);
+  assert.match(element('status').textContent, /IP request timed out/);
+  assert.equal(element('dismiss-failure').hidden, false);
+  element('dismiss-failure').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(element('status').textContent, '');
+  assert.equal(element('dismiss-failure').hidden, true);
+  await vm.runInContext('performAction({ action: "manualUpdate" })', context);
+  assert.match(element('status').textContent, /Extension connection failed/);
 });

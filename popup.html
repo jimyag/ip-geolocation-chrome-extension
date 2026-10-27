@@ -12,8 +12,6 @@
     form { margin-top: 18px; display: grid; gap: 8px; }
     label { font-size: 13px; display: grid; gap: 4px; }
     input { font: inherit; padding: 6px; min-width: 0; }
-    dialog { max-width: 280px; border: 1px solid #b33; border-radius: 6px; }
-    dialog p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -25,7 +23,8 @@
     <strong>经度:</strong> <span id="longitude">加载中...</span>
     <strong>更新于:</strong> <span id="updateTime">加载中...</span>
   </div>
-  <p id="status" role="status" style="font-size:13px;overflow-wrap:anywhere"></p>
+  <p id="status" role="status" style="font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere"></p>
+  <button id="dismiss-failure" hidden>清除最近错误提示</button>
   <p id="deferred-status" role="status" style="font-size:13px"></p>
   <button id="refresh-btn">立即刷新</button>
   <form id="manual-form" novalidate>
@@ -35,11 +34,6 @@
     <button type="button" id="automatic-btn">恢复 IP 自动定位</button>
     <small>手动设置保存在本地，持续生效直到恢复自动定位。</small>
   </form>
-  <dialog id="failure-dialog" aria-labelledby="failure-title">
-    <h3 id="failure-title">定位操作失败</h3>
-    <p id="failure-message"></p>
-    <button id="dismiss-failure">知道了，查看或设置经纬度</button>
-  </dialog>
   <script src="popup.js"></script>
 </body>
 </html>

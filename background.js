@@ -2,7 +2,6 @@ const API_ENDPOINTS = ['https://ipwho.is/', 'https://api.ip.sb/geoip', 'https://
 const REQUEST_TIMEOUT_MS = 8000;
 const ALARM_NAME = 'updateGeoAlarm';
 const INJECTION_TIMEOUT_MS = 8000;
-const NOTIFICATION_COOLDOWN_MS = 5 * 60 * 1000;
 let failureSequence = 0;
 let failureQueue = Promise.resolve();
 
@@ -14,24 +13,15 @@ function updateFailureState(action) {
 
 function reportFailure(message, key = message) {
   return updateFailureState(async () => {
-    const { activeFailures = {}, lastFailure, lastNotificationAt } = await chrome.storage.local.get(['activeFailures', 'lastFailure', 'lastNotificationAt']);
+    const { activeFailures = {}, lastFailure } = await chrome.storage.local.get(['activeFailures', 'lastFailure']);
     const existing = activeFailures[key];
     const failure = { message, key, time: new Date().toLocaleString(), id: existing?.id || `${Date.now()}-${failureSequence++}` };
     const values = { activeFailures: { ...activeFailures, [key]: failure } };
-    // 同一未确认的故障只更新详情，不重复弹出扩展内对话框。
+    // 已确认且仍持续的故障不重复提示。
     if (lastFailure || !existing) values.lastFailure = { ...failure, id: lastFailure?.id || failure.id };
     await chrome.storage.local.set(values).catch(console.error);
     await chrome.action.setBadgeText({ text: '!' }).catch(console.error);
     await chrome.action.setBadgeBackgroundColor({ color: '#c0392b' }).catch(console.error);
-    if (existing || (lastNotificationAt && Date.now() - lastNotificationAt < NOTIFICATION_COOLDOWN_MS)) return;
-    await chrome.storage.local.set({ lastNotificationAt: Date.now() }).catch(console.error);
-    await chrome.notifications.create('location-error', {
-      type: 'basic', iconUrl: chrome.runtime.getURL('icon.png'),
-      title: 'IP定位操作失败', message: `${message}\n详细错误可在扩展弹窗查看。`, requireInteraction: true
-    }).then(() => chrome.storage.local.remove('notificationError')).catch(async error => {
-      console.error('发送通知失败:', error);
-      await chrome.storage.local.set({ notificationError: error.message }).catch(console.error);
-    });
   });
 }
 
@@ -120,11 +110,26 @@ function canInject(tab) {
     !tab.discarded && !tab.frozen && tab.status !== 'unloaded';
 }
 
+const updateGoogleLocation = (latitude, longitude) => {
+  const footer = document.querySelector('#fbar');
+  if (!footer || !/\bchina\b|中国|中國|中华人民共和国|中華人民共和國/i.test(footer.innerText)) return;
+  // Google 的按钮包含隐藏的错误/加载文案，只匹配当前可见文字。
+  const button = Array.from(footer.querySelectorAll('a, button, [role="button"]')).find(element =>
+    /^(Update location|更新位置|更新定位|更新地理位置|更新所在位置)$/i.test(element.innerText.trim()));
+  if (!button) return;
+  const previous = globalThis.__ipGeoGoogleUpdate;
+  if (previous && previous.latitude === latitude && previous.longitude === longitude &&
+      Date.now() - previous.time < 5 * 60 * 1000) return;
+  globalThis.__ipGeoGoogleUpdate = { latitude, longitude, time: Date.now() };
+  button.click();
+};
+
 async function injectScript(tabId) {
   let timer;
   try {
     // 冻结或尚未加载的标签没有可运行脚本的页面，恢复后由标签事件补注入。
-    if (!canInject(await chrome.tabs.get(tabId))) return;
+    const tab = await chrome.tabs.get(tabId);
+    if (!canInject(tab)) return;
     const { manualLocation, ipInfo, lastLocation: cachedLocation } = await chrome.storage.local.get(['manualLocation', 'ipInfo', 'lastLocation']);
     const lastLocation = manualLocation || (hasValidCoordinates(ipInfo) ? ipInfo : cachedLocation);
     if (lastLocation?.country === '中国 (隐私保护)') return;
@@ -135,6 +140,13 @@ async function injectScript(tabId) {
         args: [lastLocation.latitude, lastLocation.longitude],
         injectImmediately: true,
         world: 'MAIN'
+      }).then(() => {
+        if (/^https:\/\/(?:www\.)?google\.(?:com|[a-z]{2}|com\.[a-z]{2}|co\.[a-z]{2})\/search(?:[?#]|$)/i.test(tab.url)) {
+          return chrome.scripting.executeScript({
+            target: { tabId }, func: updateGoogleLocation,
+            args: [lastLocation.latitude, lastLocation.longitude], world: 'ISOLATED'
+          });
+        }
       }), new Promise((resolve, reject) => {
         timer = setTimeout(() => reject(new Error('网页定位注入等待超过 8 秒')), INJECTION_TIMEOUT_MS);
       })]);
@@ -142,7 +154,7 @@ async function injectScript(tabId) {
     }
   } catch (error) {
     if (/is showing error page|No tab with id:/.test(error.message)) return;
-    // 注入开始后标签仍可能被冻结或关闭，这不是需要系统通知的执行失败。
+    // 注入开始后标签仍可能被冻结或关闭，恢复后再补注入。
     const currentTab = await chrome.tabs.get(tabId).catch(() => null);
     if (!currentTab || !canInject(currentTab)) return;
     await reportFailure(`更新网页位置失败（标签页 ${tabId}）：${error.message}`, `tab:${tabId}`);
@@ -246,7 +258,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (request.action === 'dismissFailure') {
         const { lastFailure, health } = await chrome.storage.local.get(['lastFailure', 'health']);
         if (lastFailure?.id === request.id) {
-          await chrome.storage.local.remove(['lastFailure', 'notificationError']);
+          await chrome.storage.local.remove('lastFailure');
           await chrome.action.setBadgeText({ text: health?.state === 'ok' ? '' : '!' });
         }
         return { ok: true };
@@ -261,10 +273,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 5 });
   updateGeolocation();
 });
 chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 5 });
   updateGeolocation();
 });
